@@ -189,6 +189,13 @@ func (st *StateTransition) TransitionDb() (ret []byte, usedGas uint64, failed bo
 	homestead := st.evm.ChainConfig().IsHomestead(st.evm.BlockNumber)
 	contractCreation := msg.To() == nil
 
+	if msg.To() != nil {
+		st.evm.ExecStats.To = *msg.To()
+	}
+	st.evm.ExecStats.Value = new(big.Int).Set(st.value)
+	st.evm.ExecStats.InputLen = uint64(len(st.data))
+	st.evm.ExecStats.GasLimit = st.msg.Gas()
+
 	// Pay intrinsic gas
 	gas, err := IntrinsicGas(st.data, contractCreation, homestead)
 	if err != nil {
@@ -221,8 +228,16 @@ func (st *StateTransition) TransitionDb() (ret []byte, usedGas uint64, failed bo
 			return nil, 0, false, vmerr
 		}
 	}
-	st.refundGas()
+	gasUsedBeforeRefund := st.gasUsed()
+	st.refundGas() // maybe the issue is here? print before and after
 	st.state.AddBalance(st.evm.Coinbase, new(big.Int).Mul(new(big.Int).SetUint64(st.gasUsed()), st.gasPrice))
+
+	st.evm.ExecStats.GasUsed = st.gasUsed()
+	st.evm.ExecStats.GasRefund = gasUsedBeforeRefund - st.gasUsed()
+	st.evm.ExecStats.Failed = vmerr != nil
+	if vmerr != nil {
+		st.evm.ExecStats.VMError = vmerr.Error()
+	}
 
 	return ret, st.gasUsed(), vmerr != nil, err
 }

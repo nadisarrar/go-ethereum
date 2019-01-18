@@ -125,6 +125,8 @@ type EVM struct {
 	// available gas is calculated in gasCall* according to the 63/64 rule and later
 	// applied in opCall*.
 	callGasTemp uint64
+	// Execution stats
+	ExecStats ExecStats
 }
 
 // NewEVM returns a new EVM. The returned EVM is not thread safe and should
@@ -159,6 +161,12 @@ func NewEVM(ctx Context, statedb StateDB, chainConfig *params.ChainConfig, vmCon
 	// as we always want to have the built-in EVM as the failover option.
 	evm.interpreters = append(evm.interpreters, NewEVMInterpreter(evm, vmConfig))
 	evm.interpreter = evm.interpreters[0]
+
+	evm.ExecStats.From = evm.Context.Origin
+	evm.ExecStats.GasPrice = new(big.Int).Set(evm.Context.GasPrice)
+	evm.ExecStats.BlockGasLimit = evm.Context.GasLimit
+	evm.ExecStats.Difficulty = new(big.Int).Set(evm.Context.Difficulty)
+	evm.ExecStats.Coinbase = evm.Context.Coinbase
 
 	return evm
 }
@@ -196,11 +204,15 @@ func (evm *EVM) Call(caller ContractRef, addr common.Address, input []byte, gas 
 		to       = AccountRef(addr)
 		snapshot = evm.StateDB.Snapshot()
 	)
+	precompiles := PrecompiledContractsHomestead
+	if evm.ChainConfig().IsByzantium(evm.BlockNumber) {
+		precompiles = PrecompiledContractsByzantium
+	}
+	if precompiles[addr] == nil {
+		// Trace calls to any address, existing and non existing, except for precompiles
+		evm.ExecStats.Writes = append(evm.ExecStats.Writes, addr)
+	}
 	if !evm.StateDB.Exist(addr) {
-		precompiles := PrecompiledContractsHomestead
-		if evm.ChainConfig().IsByzantium(evm.BlockNumber) {
-			precompiles = PrecompiledContractsByzantium
-		}
 		if precompiles[addr] == nil && evm.ChainConfig().IsEIP158(evm.BlockNumber) && value.Sign() == 0 {
 			// Calling a non existing account, don't do anything, but ping the tracer
 			if evm.vmConfig.Debug && evm.depth == 0 {
@@ -272,6 +284,7 @@ func (evm *EVM) CallCode(caller ContractRef, addr common.Address, input []byte, 
 	// only.
 	contract := NewContract(caller, to, value, gas)
 	contract.SetCallCode(&addr, evm.StateDB.GetCodeHash(addr), evm.StateDB.GetCode(addr))
+	evm.ExecStats.Reads = append(evm.ExecStats.Reads, addr)
 
 	ret, err = run(evm, contract, input, false)
 	if err != nil {
@@ -305,6 +318,7 @@ func (evm *EVM) DelegateCall(caller ContractRef, addr common.Address, input []by
 	// Initialise a new contract and make initialise the delegate values
 	contract := NewContract(caller, to, nil, gas).AsDelegate()
 	contract.SetCallCode(&addr, evm.StateDB.GetCodeHash(addr), evm.StateDB.GetCode(addr))
+	evm.ExecStats.Reads = append(evm.ExecStats.Reads, addr)
 
 	ret, err = run(evm, contract, input, false)
 	if err != nil {
@@ -338,6 +352,7 @@ func (evm *EVM) StaticCall(caller ContractRef, addr common.Address, input []byte
 	// only.
 	contract := NewContract(caller, to, new(big.Int), gas)
 	contract.SetCallCode(&addr, evm.StateDB.GetCodeHash(addr), evm.StateDB.GetCode(addr))
+	evm.ExecStats.Reads = append(evm.ExecStats.Reads, addr)
 
 	// When an error was returned by the EVM or when setting the creation code
 	// above we revert to the snapshot and consume any gas remaining. Additionally
@@ -369,9 +384,11 @@ func (evm *EVM) create(caller ContractRef, codeAndHash *codeAndHash, gas uint64,
 	// Depth check execution. Fail if we're trying to execute above the
 	// limit.
 	if evm.depth > int(params.CallCreateDepth) {
+		// no need to update ExecStats here, because address has not been used yet
 		return nil, common.Address{}, gas, ErrDepth
 	}
 	if !evm.CanTransfer(evm.StateDB, caller.Address(), value) {
+		// no need to update ExecStats here, because address has not been used yet
 		return nil, common.Address{}, gas, ErrInsufficientBalance
 	}
 	nonce := evm.StateDB.GetNonce(caller.Address())
@@ -380,6 +397,7 @@ func (evm *EVM) create(caller ContractRef, codeAndHash *codeAndHash, gas uint64,
 	// Ensure there's no existing contract already at the designated address
 	contractHash := evm.StateDB.GetCodeHash(address)
 	if evm.StateDB.GetNonce(address) != 0 || (contractHash != (common.Hash{}) && contractHash != emptyCodeHash) {
+		evm.ExecStats.Reads = append(evm.ExecStats.Reads, address)
 		return nil, common.Address{}, 0, ErrContractAddressCollision
 	}
 	// Create a new account on the state
@@ -397,6 +415,8 @@ func (evm *EVM) create(caller ContractRef, codeAndHash *codeAndHash, gas uint64,
 	contract.SetCodeOptionalHash(&address, codeAndHash)
 
 	if evm.vmConfig.NoRecursion && evm.depth > 0 {
+		// new account has been created, yet with no code
+		evm.ExecStats.Creates = append(evm.ExecStats.Creates, address)
 		return nil, address, gas, nil
 	}
 
@@ -425,8 +445,10 @@ func (evm *EVM) create(caller ContractRef, codeAndHash *codeAndHash, gas uint64,
 	// When an error was returned by the EVM or when setting the creation code
 	// above we revert to the snapshot and consume any gas remaining. Additionally
 	// when we're in homestead this also counts for code storage gas errors.
+	stateReverted := false
 	if maxCodeSizeExceeded || (err != nil && (evm.ChainConfig().IsHomestead(evm.BlockNumber) || err != ErrCodeStoreOutOfGas)) {
 		evm.StateDB.RevertToSnapshot(snapshot)
+		stateReverted = true
 		if err != errExecutionReverted {
 			contract.UseGas(contract.Gas)
 		}
@@ -437,6 +459,13 @@ func (evm *EVM) create(caller ContractRef, codeAndHash *codeAndHash, gas uint64,
 	}
 	if evm.vmConfig.Debug && evm.depth == 0 {
 		evm.vmConfig.Tracer.CaptureEnd(ret, gas-contract.Gas, time.Since(start), err)
+	}
+	if stateReverted {
+		// account creation was undone, but the new account address was accessed
+		evm.ExecStats.Reads = append(evm.ExecStats.Reads, address)
+	} else {
+		// new account has been created, even if create code execution resulted in an error
+		evm.ExecStats.Creates = append(evm.ExecStats.Creates, address)
 	}
 	return ret, address, contract.Gas, err
 

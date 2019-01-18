@@ -411,7 +411,9 @@ func opAddress(pc *uint64, interpreter *EVMInterpreter, contract *Contract, memo
 
 func opBalance(pc *uint64, interpreter *EVMInterpreter, contract *Contract, memory *Memory, stack *Stack) ([]byte, error) {
 	slot := stack.peek()
-	slot.Set(interpreter.evm.StateDB.GetBalance(common.BigToAddress(slot)))
+	addr := common.BigToAddress(slot)
+	slot.Set(interpreter.evm.StateDB.GetBalance(addr))
+	interpreter.evm.ExecStats.Reads = append(interpreter.evm.ExecStats.Reads, addr)
 	return nil, nil
 }
 
@@ -477,8 +479,9 @@ func opReturnDataCopy(pc *uint64, interpreter *EVMInterpreter, contract *Contrac
 
 func opExtCodeSize(pc *uint64, interpreter *EVMInterpreter, contract *Contract, memory *Memory, stack *Stack) ([]byte, error) {
 	slot := stack.peek()
-	slot.SetUint64(uint64(interpreter.evm.StateDB.GetCodeSize(common.BigToAddress(slot))))
-
+	addr := common.BigToAddress(slot)
+	slot.SetUint64(uint64(interpreter.evm.StateDB.GetCodeSize(addr)))
+	interpreter.evm.ExecStats.Reads = append(interpreter.evm.ExecStats.Reads, addr)
 	return nil, nil
 }
 
@@ -510,6 +513,7 @@ func opExtCodeCopy(pc *uint64, interpreter *EVMInterpreter, contract *Contract, 
 		length     = stack.pop()
 	)
 	codeCopy := getDataBig(interpreter.evm.StateDB.GetCode(addr), codeOffset, length)
+	interpreter.evm.ExecStats.Reads = append(interpreter.evm.ExecStats.Reads, addr)
 	memory.Set(memOffset.Uint64(), length.Uint64(), codeCopy)
 
 	interpreter.intPool.put(memOffset, codeOffset, length)
@@ -550,6 +554,7 @@ func opExtCodeHash(pc *uint64, interpreter *EVMInterpreter, contract *Contract, 
 	} else {
 		slot.SetBytes(interpreter.evm.StateDB.GetCodeHash(address).Bytes())
 	}
+	interpreter.evm.ExecStats.Reads = append(interpreter.evm.ExecStats.Reads, address)
 	return nil, nil
 }
 
@@ -880,7 +885,9 @@ func opStop(pc *uint64, interpreter *EVMInterpreter, contract *Contract, memory 
 
 func opSuicide(pc *uint64, interpreter *EVMInterpreter, contract *Contract, memory *Memory, stack *Stack) ([]byte, error) {
 	balance := interpreter.evm.StateDB.GetBalance(contract.Address())
-	interpreter.evm.StateDB.AddBalance(common.BigToAddress(stack.pop()), balance)
+	receiver := common.BigToAddress(stack.pop())
+	interpreter.evm.StateDB.AddBalance(receiver, balance)
+	interpreter.evm.ExecStats.Writes = append(interpreter.evm.ExecStats.Writes, receiver)
 
 	interpreter.evm.StateDB.Suicide(contract.Address())
 	return nil, nil

@@ -24,6 +24,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/params"
 )
 
@@ -68,12 +69,24 @@ func (p *StateProcessor) Process(block *types.Block, statedb *state.StateDB, cfg
 	// Iterate over and process the individual transactions
 	for i, tx := range block.Transactions() {
 		statedb.Prepare(tx.Hash(), block.Hash(), i)
-		receipt, _, err := ApplyTransaction(p.config, p.bc, nil, gp, statedb, header, tx, usedGas, cfg)
+		receipt, _, execStats, err := ApplyTransaction(p.config, p.bc, nil, gp, statedb, header, tx, usedGas, cfg)
 		if err != nil {
 			return nil, nil, 0, err
 		}
 		receipts = append(receipts, receipt)
 		allLogs = append(allLogs, receipt.Logs...)
+
+		execStats.Number = block.Number()
+		execStats.Time = block.Time()
+		execStats.TxCount = len(block.Transactions())
+		execStats.TxIndex = i
+		execStats.TxHash = tx.Hash()
+		execStats.Nonce = tx.Nonce()
+		execStats.ReceiptSize = receipt.Size()
+		execStats.ReceiptStatus = receipt.Status
+		execStats.ReceiptLogsCount = len(receipt.Logs)
+		execStats.Finalize()
+		log.Info("TX processing completed", "ExecStats", execStats)
 	}
 	// Finalize the block, applying any consensus engine specific extras (e.g. block rewards)
 	p.engine.Finalize(p.bc, header, statedb, block.Transactions(), block.Uncles(), receipts)
@@ -85,10 +98,10 @@ func (p *StateProcessor) Process(block *types.Block, statedb *state.StateDB, cfg
 // and uses the input parameters for its environment. It returns the receipt
 // for the transaction, gas used and an error if the transaction failed,
 // indicating the block was invalid.
-func ApplyTransaction(config *params.ChainConfig, bc ChainContext, author *common.Address, gp *GasPool, statedb *state.StateDB, header *types.Header, tx *types.Transaction, usedGas *uint64, cfg vm.Config) (*types.Receipt, uint64, error) {
+func ApplyTransaction(config *params.ChainConfig, bc ChainContext, author *common.Address, gp *GasPool, statedb *state.StateDB, header *types.Header, tx *types.Transaction, usedGas *uint64, cfg vm.Config) (*types.Receipt, uint64, *vm.ExecStats, error) {
 	msg, err := tx.AsMessage(types.MakeSigner(config, header.Number))
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, nil, err
 	}
 	// Create a new context to be used in the EVM environment
 	context := NewEVMContext(msg, header, bc, author)
@@ -98,7 +111,7 @@ func ApplyTransaction(config *params.ChainConfig, bc ChainContext, author *commo
 	// Apply the transaction to the current state (included in the env)
 	_, gas, failed, err := ApplyMessage(vmenv, msg, gp)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, nil, err
 	}
 	// Update the state with pending changes
 	var root []byte
@@ -122,5 +135,5 @@ func ApplyTransaction(config *params.ChainConfig, bc ChainContext, author *commo
 	receipt.Logs = statedb.GetLogs(tx.Hash())
 	receipt.Bloom = types.CreateBloom(types.Receipts{receipt})
 
-	return receipt, gas, err
+	return receipt, gas, &vmenv.ExecStats, err
 }
